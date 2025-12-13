@@ -563,9 +563,16 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 	case *dst.CallExpr:
 		_, ok := e.Fun.(*dst.SelectorExpr)
 
-		// For chains: check if the call starts OR ends on a long line
-		// (multi-line calls may start on a short line but end on a long line)
+		// For chains: check if the call starts OR ends on a long line,
+		// or if any argument is on a long line
+		// (multi-line calls may start on a short line but have long args in the middle)
 		callOnLongLine := s.isOnLongLine(e) || s.endsOnLongLine(e)
+		for _, arg := range e.Args {
+			if s.isOnLongLine(arg) {
+				callOnLongLine = true
+				break
+			}
+		}
 
 		if ok &&
 			s.config.ChainSplitDots &&
@@ -580,15 +587,21 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 			// also split the arguments. Check both start and end positions
 			// since chained calls often start on one line and end on another.
 			shortenArgs := chainAlreadySplit && (s.isOnLongLine(e) || s.endsOnLongLine(e))
+
+			// Check if args are already on their own lines
+			argsAlreadySplit := len(e.Args) <= 1 || (len(e.Args) > 0 && e.Args[0].Decorations().Before == dst.NewLine)
+
 			for a, arg := range e.Args {
-				if shortenArgs {
+				if shortenArgs && !argsAlreadySplit {
 					if a == 0 {
 						arg.Decorations().Before = dst.NewLine
 					}
 					arg.Decorations().After = dst.NewLine
 				}
-				// Don't recurse into args if we're modifying them this round
-				if !shortenArgs {
+				// If args are already split (or only 1 arg), recurse into long args
+				if argsAlreadySplit && s.isOnLongLine(arg) {
+					s.formatExpr(arg, true, true)
+				} else if !shortenArgs {
 					s.formatExpr(arg, false, true)
 				}
 			}
@@ -665,14 +678,26 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 			}
 		}
 	case *dst.FuncLit:
-		// If the function literal line is too long, expand the body
-		if shouldShorten && e.Body != nil && len(e.Body.List) > 0 {
-			// Put each statement in the body on its own line
-			for i, stmt := range e.Body.List {
-				if i == 0 {
-					stmt.Decorations().Before = dst.NewLine
+		// If the function literal line is too long, try to shorten
+		if shouldShorten {
+			// First, check if body has inline statements (single-line func lit)
+			// Expanding the body is usually the best first step
+			bodyInline := e.Body != nil && len(e.Body.List) > 0 &&
+				e.Body.List[0].Decorations().Before != dst.NewLine
+			if bodyInline {
+				for i, stmt := range e.Body.List {
+					if i == 0 {
+						stmt.Decorations().Before = dst.NewLine
+					}
+					stmt.Decorations().After = dst.NewLine
 				}
-				stmt.Decorations().After = dst.NewLine
+			} else {
+				// Body is already expanded; if params are on a long line, split them
+				paramsOnLongLine := e.Type != nil && e.Type.Params != nil &&
+					len(e.Type.Params.List) > 0 && s.isOnLongLine(e.Type.Params)
+				if paramsOnLongLine {
+					s.formatFieldList(e.Type.Params)
+				}
 			}
 			// Don't recurse into body in this round - let next round handle it
 		} else {
