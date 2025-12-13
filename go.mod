@@ -1,4 +1,4 @@
-module github.com/segmentio/golines
+module github.com/mwalkerrvw/golines
 
 go 1.23.0
 
