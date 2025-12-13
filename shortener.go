@@ -58,6 +58,11 @@ type Shortener struct {
 	// argument in the config.
 	baseFormatter     string
 	baseFormatterArgs []string
+
+	// Per-round state for position-based line length tracking
+	fset        *token.FileSet
+	dec         *decorator.Decorator
+	lineLengths map[int]int // line number -> expanded length
 }
 
 // NewShortener creates a new shortener instance from the provided config.
@@ -104,16 +109,22 @@ func (s *Shortener) Shorten(contents []byte) ([]byte, error) {
 		return nil, fmt.Errorf("error formatting source: %+v", err)
 	}
 
+	var prevContents []byte // Track previous content to detect when we stop making progress
+
 	for {
 		log.Debugf("starting round %d", round)
 
-		// Annotate all long lines
-		lines := strings.Split(string(contents), "\n")
-		annotatedLines, linesToShorten := s.annotateLongLines(lines)
+		// Pre-compute line lengths for position-based checking
+		s.computeLineLengths(contents)
+
+		// Count lines that need shortening
+		linesToShorten := s.countLongLines(contents)
+		log.Debugf("lines to shorten: %d", linesToShorten)
 		var stop bool
 
 		if linesToShorten == 0 {
 			if round == 0 {
+				lines := strings.Split(string(contents), "\n")
 				if !s.config.ReformatTags {
 					stop = true
 				} else if !HasMultiKeyTags(lines) {
@@ -122,17 +133,23 @@ func (s *Shortener) Shorten(contents []byte) ([]byte, error) {
 			} else {
 				stop = true
 			}
+		} else if round > 0 && bytes.Equal(contents, prevContents) {
+			// No progress being made - output is same as previous round
+			log.Debug("no progress being made, stopping")
+			stop = true
 		}
+
+		prevContents = contents
 
 		if stop {
 			log.Debug("nothing more to shorten or reformat, stopping")
 			break
 		}
 
-		contents = []byte(strings.Join(annotatedLines, "\n"))
-
-		// Generate AST
-		result, err := decorator.Parse(contents)
+		// Generate AST with decorator that maintains position mapping
+		s.fset = token.NewFileSet()
+		s.dec = decorator.NewDecorator(s.fset)
+		result, err := s.dec.Parse(contents)
 		if err != nil {
 			return nil, err
 		}
@@ -172,9 +189,6 @@ func (s *Shortener) Shorten(contents []byte) ([]byte, error) {
 		}
 	}
 
-	if !s.config.KeepAnnotations {
-		contents = s.removeAnnotations(contents)
-	}
 	if s.config.ShortenComments {
 		contents = s.shortenCommentsFunc(contents)
 	}
@@ -385,15 +399,16 @@ func (s *Shortener) formatNode(node dst.Node) {
 func (s *Shortener) formatDecl(decl dst.Decl) {
 	switch d := decl.(type) {
 	case *dst.FuncDecl:
-		if HasAnnotationRecursive(decl) {
-			if d.Type != nil && d.Type.Params != nil {
+		// Split function parameters if the func declaration or its params are on a long line
+		if d.Type != nil && d.Type.Params != nil {
+			if s.isOnLongLine(decl) || s.isOnLongLine(d.Type.Params) || s.endsOnLongLine(d.Type.Params) {
 				s.formatFieldList(d.Type.Params)
 			}
 		}
 		s.formatStmt(d.Body)
 	case *dst.GenDecl:
 		for _, spec := range d.Specs {
-			s.formatSpec(spec, HasAnnotation(decl))
+			s.formatSpec(spec, s.isOnLongLine(decl))
 		}
 	default:
 		log.Debugf(
@@ -425,7 +440,7 @@ func (s *Shortener) formatStmt(stmt dst.Stmt) {
 		return
 	}
 
-	shouldShorten := HasAnnotation(stmt)
+	shouldShorten := s.isOnLongLine(stmt)
 
 	switch st := stmt.(type) {
 	case *dst.AssignStmt:
@@ -531,7 +546,7 @@ func (s *Shortener) formatStmt(stmt dst.Stmt) {
 // formatExpr formats an AST expression node. These include uniary and binary expressions, function
 // literals, and key/value pair statements, among others.
 func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
-	shouldShorten := force || HasAnnotation(expr)
+	shouldShorten := force || s.isOnLongLine(expr)
 
 	switch e := expr.(type) {
 	case *dst.BinaryExpr:
@@ -546,19 +561,25 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 			s.formatExpr(e.Y, shouldShorten, isChain)
 		}
 	case *dst.CallExpr:
-		selectorExpr, ok := e.Fun.(*dst.SelectorExpr)
+		_, ok := e.Fun.(*dst.SelectorExpr)
+
+		// For chains: check if the call starts OR ends on a long line
+		// (multi-line calls may start on a short line but end on a long line)
+		callOnLongLine := s.isOnLongLine(e) || s.endsOnLongLine(e)
 
 		if ok &&
 			s.config.ChainSplitDots &&
-			(shouldShorten || HasAnnotationRecursive(e)) &&
+			(shouldShorten || callOnLongLine) &&
 			(isChain || s.chainLength(e) > 1) {
+			// Check if chain was already split in a previous round
+			chainAlreadySplit := s.hasChainNewline(e)
+
 			e.Decorations().After = dst.NewLine
 
-			// If this specific call is annotated (line still too long after chain split),
-			// also split the arguments. The annotation may be on the CallExpr, the
-			// SelectorExpr, or the method name Ident.
-			shortenArgs := HasAnnotation(e) || HasAnnotation(selectorExpr) ||
-				HasAnnotation(selectorExpr.Sel)
+			// If the chain was already split but the line is still too long,
+			// also split the arguments. Check both start and end positions
+			// since chained calls often start on one line and end on another.
+			shortenArgs := chainAlreadySplit && (s.isOnLongLine(e) || s.endsOnLongLine(e))
 			for a, arg := range e.Args {
 				if shortenArgs {
 					if a == 0 {
@@ -566,12 +587,16 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 					}
 					arg.Decorations().After = dst.NewLine
 				}
-				s.formatExpr(arg, shortenArgs, true)
+				// Don't recurse into args if we're modifying them this round
+				if !shortenArgs {
+					s.formatExpr(arg, false, true)
+				}
 			}
 
 			s.formatExpr(e.Fun, shouldShorten, true)
 		} else {
-			shortenChildArgs := shouldShorten || HasAnnotationRecursive(e)
+			// Shorten if this call starts OR ends on a long line
+			shortenChildArgs := s.isOnLongLine(e) || s.endsOnLongLine(e)
 
 			for a, arg := range e.Args {
 				if shortenChildArgs {
@@ -582,26 +607,62 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 					}
 					arg.Decorations().After = dst.NewLine
 				}
-				s.formatExpr(arg, false, isChain)
+				// If we're splitting this call's args, don't recurse into them.
+				// They'll be on their own lines after this round and will be
+				// evaluated in the next round based on the new line lengths.
+				if !shortenChildArgs {
+					s.formatExpr(arg, false, isChain)
+				}
 			}
 			s.formatExpr(e.Fun, shouldShorten, isChain)
 		}
 	case *dst.CompositeLit:
-		// Check if we should shorten - either because the parent told us to,
-		// or because one of the elements has an annotation (meaning the line
-		// with the elements is too long)
-		shortenElements := shouldShorten || HasAnnotationRecursive(e)
-		if shortenElements {
+		// Check if this composite lit is on a long line
+		compositeLitOnLongLine := s.isOnLongLine(e)
+		// Check if any element is on a long line
+		elementsOnLongLine := make(map[int]bool)
+		for i, element := range e.Elts {
+			if s.isOnLongLine(element) {
+				elementsOnLongLine[i] = true
+			}
+		}
+		shortenElements := compositeLitOnLongLine || len(elementsOnLongLine) > 0
+
+		// Check if elements are already on their own lines (each element has After=NewLine)
+		alreadySplit := true
+		for _, element := range e.Elts {
+			if element.Decorations().After != dst.NewLine {
+				alreadySplit = false
+				break
+			}
+		}
+		if len(e.Elts) == 0 {
+			alreadySplit = false
+		}
+
+		if shortenElements && !alreadySplit {
+			// Split elements onto their own lines
 			for i, element := range e.Elts {
 				if i == 0 {
 					element.Decorations().Before = dst.NewLine
 				}
 				element.Decorations().After = dst.NewLine
 			}
-		}
-
-		for _, element := range e.Elts {
-			s.formatExpr(element, false, isChain)
+			// Don't recurse this round - wait for next round with fresh positions
+		} else if alreadySplit {
+			// Elements are already split; recurse into long elements
+			for i, element := range e.Elts {
+				if elementsOnLongLine[i] {
+					s.formatExpr(element, true, isChain)
+				} else {
+					s.formatExpr(element, false, isChain)
+				}
+			}
+		} else {
+			// Not shortening, recurse normally
+			for _, element := range e.Elts {
+				s.formatExpr(element, false, isChain)
+			}
 		}
 	case *dst.FuncLit:
 		// If the function literal line is too long, expand the body
@@ -613,15 +674,17 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 				}
 				stmt.Decorations().After = dst.NewLine
 			}
+			// Don't recurse into body in this round - let next round handle it
+		} else {
+			s.formatStmt(e.Body)
 		}
-		s.formatStmt(e.Body)
 	case *dst.FuncType:
 		if shouldShorten {
 			s.formatFieldList(e.Params)
 		}
 	case *dst.InterfaceType:
 		for _, method := range e.Methods.List {
-			if HasAnnotation(method) {
+			if s.isOnLongLine(method) {
 				s.formatExpr(method.Type, true, isChain)
 			}
 		}
@@ -647,7 +710,7 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 
 // formatSpec formats an AST spec node. These include type specifications, among other things.
 func (s *Shortener) formatSpec(spec dst.Spec, force bool) {
-	shouldShorten := HasAnnotation(spec) || force
+	shouldShorten := s.isOnLongLine(spec) || force
 	switch sp := spec.(type) {
 	case *dst.ValueSpec:
 		for _, expr := range sp.Values {
@@ -703,4 +766,134 @@ func (s *Shortener) chainLength(callExpr *dst.CallExpr) int {
 	}
 
 	return numCalls
+}
+
+// computeLineLengths pre-computes the expanded length of each line in the source.
+func (s *Shortener) computeLineLengths(contents []byte) {
+	s.lineLengths = make(map[int]int)
+	lines := strings.Split(string(contents), "\n")
+	for i, line := range lines {
+		s.lineLengths[i+1] = s.lineLen(line) // lines are 1-indexed in token.Position
+	}
+}
+
+// countLongLines counts the number of non-comment lines that exceed MaxLen.
+func (s *Shortener) countLongLines(contents []byte) int {
+	count := 0
+	lines := strings.Split(string(contents), "\n")
+	for _, line := range lines {
+		if !s.isComment(line) && s.lineLen(line) > s.config.MaxLen {
+			count++
+		}
+	}
+	return count
+}
+
+// isOnLongLine checks if the given DST node STARTS on a line that exceeds MaxLen.
+func (s *Shortener) isOnLongLine(node dst.Node) bool {
+	if s.dec == nil || s.fset == nil {
+		return false
+	}
+	astNode, ok := s.dec.Map.Ast.Nodes[node]
+	if !ok || astNode == nil {
+		return false
+	}
+	pos := s.fset.Position(astNode.Pos())
+	length, ok := s.lineLengths[pos.Line]
+	if !ok {
+		return false
+	}
+	return length > s.config.MaxLen
+}
+
+// endsOnLongLine checks if the given DST node ENDS on a line that exceeds MaxLen.
+// This is used for multi-line nodes where the start is on a short line but the
+// end (closing bracket) is on a long line.
+func (s *Shortener) endsOnLongLine(node dst.Node) bool {
+	if s.dec == nil || s.fset == nil {
+		return false
+	}
+	astNode, ok := s.dec.Map.Ast.Nodes[node]
+	if !ok || astNode == nil {
+		return false
+	}
+	pos := s.fset.Position(astNode.End())
+	length, ok := s.lineLengths[pos.Line]
+	if !ok {
+		return false
+	}
+	return length > s.config.MaxLen
+}
+
+// getLine returns the source line number for the given node's start, or -1 if unknown.
+func (s *Shortener) getLine(node dst.Node) int {
+	if s.dec == nil || s.fset == nil {
+		return -1
+	}
+	astNode, ok := s.dec.Map.Ast.Nodes[node]
+	if !ok || astNode == nil {
+		return -1
+	}
+	return s.fset.Position(astNode.Pos()).Line
+}
+
+// getEndLine returns the source line number for the given node's end, or -1 if unknown.
+func (s *Shortener) getEndLine(node dst.Node) int {
+	if s.dec == nil || s.fset == nil {
+		return -1
+	}
+	astNode, ok := s.dec.Map.Ast.Nodes[node]
+	if !ok || astNode == nil {
+		return -1
+	}
+	return s.fset.Position(astNode.End()).Line
+}
+
+// isOnLongLineRecursive checks if the given node or any of its children is on a long line.
+func (s *Shortener) isOnLongLineRecursive(node dst.Node) bool {
+	if s.isOnLongLine(node) {
+		return true
+	}
+
+	result := false
+	dst.Inspect(node, func(n dst.Node) bool {
+		if n != nil && s.isOnLongLine(n) {
+			result = true
+			return false // stop inspection
+		}
+		return true
+	})
+	return result
+}
+
+// hasChainNewline checks if the given call or any inner call in the chain has a newline
+// decoration before its method selector, indicating the chain was split in a previous round.
+func (s *Shortener) hasChainNewline(callExpr *dst.CallExpr) bool {
+	// First check THIS call's selector
+	if sel, ok := callExpr.Fun.(*dst.SelectorExpr); ok {
+		if sel.Sel.Decorations().Before == dst.NewLine {
+			return true
+		}
+	}
+
+	// Then check inner calls in the chain
+	currCall := callExpr
+	for {
+		selectorExpr, ok := currCall.Fun.(*dst.SelectorExpr)
+		if !ok {
+			break
+		}
+		currCall, ok = selectorExpr.X.(*dst.CallExpr)
+		if !ok {
+			break
+		}
+		// Check the inner call's selector
+		if innerSel, ok := currCall.Fun.(*dst.SelectorExpr); ok {
+			if innerSel.Sel.Decorations().Before == dst.NewLine {
+				return true
+			}
+		}
+	}
+
+	return false
 }

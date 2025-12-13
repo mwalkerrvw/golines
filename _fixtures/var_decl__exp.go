@@ -17,7 +17,6 @@ var abc, cde = []string{
 		"sixth argument",
 	),
 }, []string{}
-
 var myMap = map[string]string{
 	"first key":  "first value",
 	"second key": "second value",

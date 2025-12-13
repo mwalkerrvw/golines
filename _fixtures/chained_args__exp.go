@@ -16,6 +16,10 @@ func testChainedArgs() {
 	l := Logger{}
 
 	// Long argument inside a chained method call - should split the arguments
-	l.Str("key", strings.Join(Map(messages, func(message string, _ int) string { return message + message + message }), ",")).
+	l.Str("key", strings.Join(Map(
+		messages,
+		func(message string, _ int) string { return message + message + message },
+	), ","),
+	).
 		Msgf("Message with format %s", "arg")
 }
