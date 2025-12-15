@@ -74,3 +74,26 @@ type Struct10 struct {
 	Field2   string                `info:"value2"`
 	MyStruct `json:"field"   info:"value3"`
 }
+
+// Struct11 tests that backslashes in tag values are preserved.
+// See https://github.com/segmentio/golines/issues/142.
+type Struct11 struct {
+	Field1 int
+	Field2 any `json:"field"    validate:"\\d+"`
+}
+
+// Struct12 tests that backslashes in tag values don't break alignment.
+// The validate tag has backslashes which expand when escaped; alignment should still work.
+type Struct12 struct {
+	Field1 string `json:"field1" validate:"\\d+" info:"first"`
+	Field2 string `json:"field2" validate:"abc" info:"second"`
+	Field3 string `json:"f3"     validate:"\\\\escaped\\\\" info:"third"`
+}
+
+// Struct13 tests multi-byte characters combined with escape sequences.
+// Both backslashes and multi-byte chars (ãï) affect width calculation differently.
+type Struct13 struct {
+	Field1 string `json:"field1" validate:"\\d+" info:"ãï first"`
+	Field2 string `json:"ãï"     validate:"test" info:"second"`
+	Field3 string `json:"field3" validate:"\\\\ãï\\\\" info:"third ãï"`
+}
