@@ -97,8 +97,10 @@ func alignTags(fields []*dst.Field) {
 		for _, key := range subTagKeys {
 			value := structTag.Get(key)
 
-			// Tag is key, value, and some extra chars (two quotes + one colon)
-			width := len(key) + tagValueLen(value) + 3
+			// Tag is key, quoted value, and a colon. Use %q to get the properly
+			// escaped value, and count runes for correct alignment with
+			// multi-byte characters.
+			width := len(key) + quotedTagValueLen(value) + 1
 
 			if _, ok := maxTagWidths[key]; !ok {
 				maxTagWidths[key] = width
@@ -137,8 +139,8 @@ func alignTags(fields []*dst.Field) {
 			lenUsed := 0
 
 			if ok {
-				tagComponents = append(tagComponents, fmt.Sprintf("%s:\"%s\"", key, value))
-				lenUsed += len(key) + tagValueLen(value) + 3
+				tagComponents = append(tagComponents, fmt.Sprintf("%s:%q", key, value))
+				lenUsed += len(key) + quotedTagValueLen(value) + 1
 			} else {
 				tagComponents = append(tagComponents, "")
 			}
@@ -157,10 +159,16 @@ func alignTags(fields []*dst.Field) {
 	}
 }
 
-// get real tag value's length, fix multi-byte character's length, such as `ï`
-// or `中文`
+// tagValueLen returns the rune length of a string, fixing multi-byte character
+// length issues for characters like `ï` or `中文`.
 func tagValueLen(s string) int {
 	return len([]rune(s))
+}
+
+// quotedTagValueLen returns the rune length of a %q-formatted string.
+// This accounts for escape sequences (like backslashes) and multi-byte characters.
+func quotedTagValueLen(s string) int {
+	return len([]rune(fmt.Sprintf("%q", s)))
 }
 
 // getWidth tries to guess the formatted width of a dst node expression. If this isn't (yet)
