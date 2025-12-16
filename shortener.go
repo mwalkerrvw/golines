@@ -236,60 +236,6 @@ func (s *Shortener) formatSrc(contents []byte) ([]byte, error) {
 	return outBuffer.Bytes(), nil
 }
 
-// annotateLongLines adds specially-formatted comments to all eligible lines that are longer than
-// the configured target length. If a line already has one of these comments from a previous
-// shortening round, then the comment contents are updated.
-func (s *Shortener) annotateLongLines(lines []string) ([]string, int) {
-	annotatedLines := []string{}
-	linesToShorten := 0
-	prevLen := -1
-
-	for _, line := range lines {
-		length := s.lineLen(line)
-
-		if prevLen > -1 {
-			if length <= s.config.MaxLen {
-				// Shortening successful, remove previous annotation
-				annotatedLines = annotatedLines[:len(annotatedLines)-1]
-			} else if length < prevLen {
-				// Replace annotation with new length
-				annotatedLines[len(annotatedLines)-1] = CreateAnnotation(length)
-				linesToShorten++
-			} else {
-				// Line is still too long with no progress, but keep trying
-				// (maxRounds will prevent infinite loops)
-				linesToShorten++
-			}
-		} else if !s.isComment(line) && length > s.config.MaxLen {
-			annotatedLines = append(
-				annotatedLines,
-				CreateAnnotation(length),
-			)
-			linesToShorten++
-		}
-
-		annotatedLines = append(annotatedLines, line)
-		prevLen = ParseAnnotation(line)
-	}
-
-	return annotatedLines, linesToShorten
-}
-
-// removeAnnotations removes all comments that were added by the annotateLongLines
-// function above.
-func (s *Shortener) removeAnnotations(contents []byte) []byte {
-	cleanedLines := []string{}
-	lines := strings.Split(string(contents), "\n")
-
-	for _, line := range lines {
-		if !IsAnnotation(line) {
-			cleanedLines = append(cleanedLines, line)
-		}
-	}
-
-	return []byte(strings.Join(cleanedLines, "\n"))
-}
-
 // shortenCommentsFunc attempts to shorten long comments in the provided source. As noted
 // in the repo README, this functionality has some quirks and is disabled by default.
 func (s *Shortener) shortenCommentsFunc(contents []byte) []byte {
