@@ -598,11 +598,13 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 					}
 					arg.Decorations().After = dst.NewLine
 				}
-				// If args are already split (or only 1 arg), recurse into long args
+				// If args are already split (or only 1 arg), recurse into long args.
+				// Pass isChain=false for args - they're not part of the chain itself
+				// and should use regular call-shortening logic if they need splitting.
 				if argsAlreadySplit && s.isOnLongLine(arg) {
-					s.formatExpr(arg, true, true)
+					s.formatExpr(arg, true, false)
 				} else if !shortenArgs {
-					s.formatExpr(arg, false, true)
+					s.formatExpr(arg, false, false)
 				}
 			}
 
