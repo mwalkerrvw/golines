@@ -589,10 +589,11 @@ func (s *Shortener) formatExpr(expr dst.Expr, force bool, isChain bool) {
 		}
 		shortenElements := compositeLitOnLongLine || len(elementsOnLongLine) > 0
 
-		// Check if elements are already on their own lines (each element has After=NewLine)
+		// Check if elements are already on their own lines (each element has After=NewLine or EmptyLine)
 		alreadySplit := true
 		for _, element := range e.Elts {
-			if element.Decorations().After != dst.NewLine {
+			afterDec := element.Decorations().After
+			if afterDec != dst.NewLine && afterDec != dst.EmptyLine {
 				alreadySplit = false
 				break
 			}
